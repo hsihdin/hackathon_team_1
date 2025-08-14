@@ -2,6 +2,10 @@ from flask import Flask, request, jsonify
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -11,7 +15,8 @@ DB_CONFIG = {
     'database': os.getenv('DB_NAME', 'hackathon'),
     'user': os.getenv('DB_USER', 'postgres'),
     'password': os.getenv('DB_PASSWORD', 'password'),
-    'port': os.getenv('DB_PORT', '5432')
+    'port': os.getenv('DB_PORT', '5432'),
+    'sslmode': os.getenv('DB_SSLMODE', 'prefer')
 }
 
 def get_db_connection():
@@ -135,4 +140,7 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"Error creating tables: {e}")
     
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    # Use PORT environment variable for production
+    port = int(os.environ.get('PORT', 5001))
+    debug_mode = os.environ.get('FLASK_ENV') == 'development'
+    app.run(debug=debug_mode, host='0.0.0.0', port=port)

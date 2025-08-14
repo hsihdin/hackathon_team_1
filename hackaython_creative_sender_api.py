@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 import os
 from dotenv import load_dotenv
 
@@ -12,7 +12,7 @@ app = Flask(__name__)
 # Database configuration
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
-    'database': os.getenv('DB_NAME', 'hackathon'),
+    'dbname': os.getenv('DB_NAME', 'hackathon'),
     'user': os.getenv('DB_USER', 'postgres'),
     'password': os.getenv('DB_PASSWORD', 'password'),
     'port': os.getenv('DB_PORT', '5432'),
@@ -22,9 +22,11 @@ DB_CONFIG = {
 def get_db_connection():
     """Create and return a database connection"""
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        # Build connection string for psycopg3
+        conn_string = f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}?sslmode={DB_CONFIG['sslmode']}"
+        conn = psycopg.connect(conn_string)
         return conn
-    except psycopg2.Error as e:
+    except psycopg.Error as e:
         print(f"Database connection error: {e}")
         return None
 
@@ -48,7 +50,7 @@ def get_creative():
         if not conn:
             return jsonify({'error': 'Database connection failed'}), 500
         
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor(row_factory=dict_row)
         
         # Query to get creatives based on adTag (matching against creative_title for demo)
         # In a real scenario, you might have an ad_tags table or similar

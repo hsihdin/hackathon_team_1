@@ -494,14 +494,14 @@ def get_creative():
             return jsonify({'error': 'Database connection failed'}), 500
         
         cursor = conn.cursor(row_factory=dict_row)
+        print(ad_tag)
         
         # Query to get creatives based on adTag (matching against creative_title for demo)
         # In a real scenario, you might have an ad_tags table or similar
-        query = """
-         SELECT creative_id, creative_title, creative_description, creative_s3_url, ad_item_id
+        query = f"""
+        SELECT creative_id, creative_title, creative_description, creative_s3_url, ad_item_id
         FROM creative_new
-        WHERE tags ILIKE %s 
-        ORDER BY creative_id
+        WHERE tags::text ad_tag
         LIMIT 10
         """
         

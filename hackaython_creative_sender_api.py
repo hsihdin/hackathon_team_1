@@ -99,6 +99,260 @@ def optimize_image_for_api(image, max_size=(1024, 1024), quality=85):
         print(f"Error optimizing image: {e}")
         return image
 
+def generate_gemini_images(base_s3_url, company_names, selected_platforms):
+    """
+    Generate images using Gemini with templates
+    Args:
+        base_s3_url: S3 URL of the base product image
+        company_names: Array of company names
+        selected_platforms: Array of selected platforms
+    Returns:
+        Dictionary with generated images for each platform and dimension
+    """
+    print("=" * 80)
+    print("🚀 STARTING GEMINI IMAGE GENERATION")
+    print("=" * 80)
+    print(f"📋 Input parameters:")
+    print(f"   Base S3 URL: {base_s3_url}")
+    print(f"   Company names: {company_names}")
+    print(f"   Selected platforms: {selected_platforms}")
+    
+    if not GENAI_ENABLED:
+        print("❌ Gemini API not enabled, skipping image generation")
+        return {}
+    
+    try:
+        # Download base product image
+        print(f"\n📥 STEP 1: Downloading base product image")
+        print(f"   URL: {base_s3_url}")
+        response = requests.get(base_s3_url, timeout=30)
+        response.raise_for_status()
+        print(f"   ✅ Downloaded successfully: {len(response.content)} bytes")
+        
+        base_image = Image.open(io.BytesIO(response.content))
+        print(f"   📐 Original image size: {base_image.size}")
+        
+        base_image = optimize_image_for_api(base_image)
+        print(f"   🔧 Optimized image size: {base_image.size}")
+        
+        generated_creatives = {}
+        
+        # Get templates from database for each platform
+        print(f"\n🗄️ STEP 2: Connecting to database")
+        conn = get_db_connection()
+        if not conn:
+            print("❌ Database connection failed for template retrieval")
+            return {}
+        print("   ✅ Database connection successful")
+        
+        cursor = conn.cursor(row_factory=dict_row)
+        
+        # Debug: Show available platforms in database
+        print(f"\n📊 STEP 3: Checking available platforms")
+        cursor.execute("SELECT platform_name FROM platform")
+        available_platforms = [row['platform_name'] for row in cursor.fetchall()]
+        print(f"   📋 Available platforms in database: {available_platforms}")
+        print(f"   🎯 Selected platforms: {selected_platforms}")
+        
+        for platform in selected_platforms:
+            print(f"\n🎨 STEP 4: Processing platform: {platform}")
+            
+            # Get all templates for this platform (multiple rows)
+            query = """
+            SELECT dimension, templates FROM platform 
+            WHERE (platform_name ILIKE %s OR platform_name ILIKE %s) 
+            AND templates IS NOT NULL
+            """
+            # Try both lowercase and capitalized versions
+            cursor.execute(query, (platform, platform.capitalize()))
+            results = cursor.fetchall()
+            
+            print(f"   🔍 Query executed for platform: {platform}")
+            print(f"   📊 Found {len(results)} template rows")
+            
+            if not results:
+                print(f"   ❌ No templates found for platform: {platform}")
+                continue
+            
+            platform_creatives = {}
+            
+            # Process each dimension row
+            for row in results:
+                dimension = row['dimension']
+                templates = row['templates']
+                
+                if isinstance(templates, str):
+                    templates = json.loads(templates)
+                
+                print(f"\n   📐 Processing dimension: {dimension}")
+                print(f"      📋 Template data: {templates}")
+                dimension_creatives = {}
+                
+                # Process each version in this dimension
+                for version_name, template_data in templates.items():
+                    print(f"\n      🎯 Processing version: {version_name}")
+                    print(f"         📍 Template coordinates: top={template_data['top']}, left={template_data['left']}, right={template_data['right']}, bottom={template_data['bottom']}")
+                    
+                    # Download template image
+                    template_url = template_data['url']
+                    print(f"         📥 Downloading template from: {template_url}")
+                    try:
+                        template_response = requests.get(template_url, timeout=30)
+                        template_response.raise_for_status()
+                        print(f"         ✅ Template downloaded: {len(template_response.content)} bytes")
+                        
+                        template_image = Image.open(io.BytesIO(template_response.content))
+                        print(f"         📐 Template image size: {template_image.size}")
+                        
+                        template_image = optimize_image_for_api(template_image)
+                        print(f"         🔧 Template optimized size: {template_image.size}")
+                    except Exception as e:
+                        print(f"         ❌ Failed to download template {template_url}: {e}")
+                        continue
+                    
+                    # Extract coordinates from template
+                    top = template_data['top']
+                    left = template_data['left']
+                    right = template_data['right']
+                    bottom = template_data['bottom']
+                    
+                    # Create Gemini prompt with dynamic coordinates
+                    prompt = f"""You are an image editing model. Do not modify any part of the image except the specified rectangular area. Do not change any other element apart from adding an image
+Keep all text, gradients, prices, reviews, and background elements exactly as they are.
+The input creative contains a placeholder rectangle located at:
+Top-left pixel: [{left}, {top}]
+Bottom-right pixel: [{right}, {bottom}]
+Paste the user-provided product photo into that rectangle, resizing it proportionally to exactly fit.
+Preserve sharpness and edges. Do not rotate, crop, or alter the product. Do not add extra shadows, reflections, or text.
+Output the final composite image in the same resolution as the input creative.
+Ensure zero changes to any pixels outside the placeholder rectangle."""
+                    
+                    try:
+                        # Call Gemini API
+                        print(f"         🤖 STEP 5: Calling Gemini API")
+                        print(f"            Platform: {platform}")
+                        print(f"            Dimension: {dimension}")
+                        print(f"            Version: {version_name}")
+                        
+                        # Create Gemini client
+                        print(f"         🔑 Creating Gemini client...")
+                        client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+                        print(f"         ✅ Gemini client created")
+                        
+                        # Prepare images for Gemini - use PIL images directly
+                        print(f"         🖼️ Preparing images for Gemini...")
+                        print(f"         ✅ Images prepared for Gemini")
+                        
+                        # Call Gemini
+                        print(f"         📡 Sending request to Gemini...")
+                        print(f"         📝 Prompt length: {len(prompt)} characters")
+                        response = client.models.generate_content(
+                            model="gemini-2.0-flash-preview-image-generation",
+                            contents=[
+                                prompt,
+                                base_image,
+                                template_image
+                            ],
+                            config=types.GenerateContentConfig(
+                                response_modalities=['TEXT', 'IMAGE']
+                            )
+                        )
+                        print(f"         ✅ Gemini response received")
+                        
+                        if response.candidates and response.candidates[0].content.parts:
+                            print(f"         📊 Processing Gemini response...")
+                            # Get generated image
+                            generated_image_part = response.candidates[0].content.parts[0]
+                            print(f"         📦 Response part type: {type(generated_image_part).__name__}")
+                            print(f"         🔍 Response part attributes: {dir(generated_image_part)}")
+                            
+                            if hasattr(generated_image_part, 'inline_data') and generated_image_part.inline_data is not None:
+                                print(f"         🖼️ Found image data in response")
+                                # Convert generated image to PIL Image
+                                generated_image_bytes = generated_image_part.inline_data.data
+                                print(f"         📏 Generated image size: {len(generated_image_bytes)} bytes")
+                                
+                                generated_image = Image.open(io.BytesIO(generated_image_bytes))
+                                print(f"         📐 Generated image dimensions: {generated_image.size}")
+                                
+                                # Save Gemini image locally
+                                filename = f"{uuid.uuid4()}_{platform}_{dimension}_{version_name}.jpg"
+                                print(f"         💾 Saving image as: {filename}")
+                                local_path = save_image_locally(generated_image, filename)
+                                
+                                if local_path:
+                                    dimension_creatives[version_name] = {"url": local_path}
+                                    print(f"         ✅ Successfully generated and saved: {local_path}")
+                                else:
+                                    print(f"         ❌ Failed to save generated image locally")
+                            else:
+                                print(f"         ❌ No image data in Gemini response")
+                                print(f"         🔍 inline_data is: {generated_image_part.inline_data}")
+                                if hasattr(generated_image_part, 'text'):
+                                    print(f"         📝 Text response: {generated_image_part.text}")
+                        else:
+                            print(f"         ❌ No response from Gemini API")
+                            print(f"         🔍 Response structure: {response}")
+                            if hasattr(response, 'candidates'):
+                                print(f"         🔍 Candidates: {response.candidates}")
+                            
+                    except Exception as e:
+                        print(f"         ❌ Error calling Gemini API: {e}")
+                        print(f"         🔍 Error type: {type(e).__name__}")
+                        # Fallback to simple overlay
+                        print(f"         🔄 Using fallback overlay method")
+                        fallback_image = create_simple_overlay(base_image, template_image)
+                        if fallback_image:
+                            try:
+                                print(f"         💾 Saving fallback image...")
+                                # Save fallback image locally
+                                filename = f"{uuid.uuid4()}_{platform}_{dimension}_{version_name}_fallback.jpg"
+                                local_path = save_image_locally(fallback_image, filename)
+                                
+                                if local_path:
+                                    dimension_creatives[version_name] = {"url": local_path}
+                                    print(f"         ✅ Fallback image saved: {local_path}")
+                                else:
+                                    print(f"         ❌ Failed to save fallback image locally")
+                            except Exception as fallback_error:
+                                print(f"         ❌ Error saving fallback image: {fallback_error}")
+                        else:
+                            print(f"         ❌ Fallback overlay failed")
+                
+                if dimension_creatives:
+                    platform_creatives[dimension] = dimension_creatives
+                    print(f"      ✅ Added {len(dimension_creatives)} versions for dimension {dimension}")
+                else:
+                    print(f"      ❌ No creatives generated for dimension {dimension}")
+            
+            if platform_creatives:
+                generated_creatives[platform] = platform_creatives
+                print(f"   ✅ Added {len(platform_creatives)} dimensions for platform {platform}")
+            else:
+                print(f"   ❌ No creatives generated for platform {platform}")
+        
+        cursor.close()
+        conn.close()
+        print(f"   🔌 Database connection closed")
+        
+        print(f"\n" + "=" * 80)
+        print(f"🎉 GEMINI GENERATION COMPLETE")
+        print(f"=" * 80)
+        print(f"📊 Summary:")
+        print(f"   Total platforms processed: {len(selected_platforms)}")
+        print(f"   Platforms with creatives: {len(generated_creatives)}")
+        for platform, dimensions in generated_creatives.items():
+            print(f"   📱 {platform}: {len(dimensions)} dimensions")
+            for dimension, versions in dimensions.items():
+                print(f"      📐 {dimension}: {len(versions)} versions")
+        print(f"=" * 80)
+        
+        return generated_creatives
+        
+    except Exception as e:
+        print(f"Error in generate_gemini_images: {e}")
+        return {}
+
 # Configure AWS S3 (Optional)
 try:
     s3_client = boto3.client(
@@ -686,14 +940,19 @@ def crop_image(image_url, selected_platforms):
                     filename = f"{uuid.uuid4()}_{platform}_{dimension}.jpg"
                     
                     # Upload base64 image object to S3
-                    s3_url = upload_image_to_s3(image_bytes, filename)
-                    if s3_url:
-                        # Add S3 URL to the image object
-                        image_object["s3_url"] = s3_url
-                        platform_crops[dimension] = image_object
-                        print(f"    Uploaded {dimension} to S3: {s3_url}")
-                    else:
-                        print(f"    Failed to upload {dimension} to S3, keeping base64 only")
+                    try:
+                        s3_url = upload_image_to_s3(image_bytes, filename)
+                        if s3_url:
+                            # Add S3 URL to the image object
+                            image_object["s3_url"] = s3_url
+                            platform_crops[dimension] = image_object
+                            print(f"    Uploaded {dimension} to S3: {s3_url}")
+                        else:
+                            print(f"    Failed to upload {dimension} to S3, keeping base64 only")
+                            platform_crops[dimension] = image_object
+                    except Exception as upload_error:
+                        print(f"    Error uploading to S3: {upload_error}")
+                        print(f"    Error type: {type(upload_error).__name__}")
                         platform_crops[dimension] = image_object
                 
                 cropped_images[platform] = platform_crops
@@ -784,6 +1043,11 @@ def add_new_creative():
         if crop is None:
             crop = {}  # Set empty dict if cropping fails
         image_json = json.dumps(crop)  # Store cropped images in image_data
+        
+        # Generate Gemini images with templates
+        print("Starting Gemini image generation...")
+        generated_creatives = generate_gemini_images(image, [], selected_platforms)  # Empty company_names for now
+        generated_creatives_json = json.dumps(generated_creatives)
         # Connect to databaseƒ
         conn = get_db_connection()
         if not conn:
@@ -796,16 +1060,16 @@ def add_new_creative():
         INSERT INTO creative_new (
             creative_title, creative_description, campaign, format_type, 
             tags, dynamic_elements, image_data, creative_s3_url, 
-            selected_platforms, ad_item_id
+            selected_platforms, generated_creatives, ad_item_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING creative_id
         """
         
         cursor.execute(query, (
             title, description, campaign, format_type, 
             tags_json, dynamic_elements_json, image_json, image,
-            selected_platforms_json, add_item_id
+            selected_platforms_json, generated_creatives_json, add_item_id
         ))
         new_creative_id = cursor.fetchone()[0]
         
@@ -1129,6 +1393,51 @@ def test_s3_config():
     except Exception as e:
         return jsonify({'error': f'S3 test failed: {e}'}), 500
 
+@app.route('/platforms', methods=['GET'])
+def get_platforms():
+    """Get all platforms and their templates"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Database connection failed'}), 500
+        
+        cursor = conn.cursor(row_factory=dict_row)
+        
+        query = """
+        SELECT platform_name, dimension, templates 
+        FROM platform 
+        ORDER BY platform_name
+        """
+        
+        cursor.execute(query)
+        results = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        platforms = []
+        for row in results:
+            platform_data = {
+                'platform_name': row['platform_name'],
+                'dimension': row['dimension'],
+                'has_templates': bool(row.get('templates'))
+            }
+            
+            # Parse templates if they exist
+            if row.get('templates'):
+                if isinstance(row['templates'], str):
+                    platform_data['templates'] = json.loads(row['templates'])
+                else:
+                    platform_data['templates'] = row['templates']
+            
+            platforms.append(platform_data)
+        
+        return jsonify({'platforms': platforms}), 200
+        
+    except Exception as e:
+        print(f"Error getting platforms: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({'error': 'Endpoint not found'}), 404
@@ -1149,7 +1458,8 @@ if __name__ == '__main__':
                 CREATE TABLE IF NOT EXISTS platform (
                     platform_id SERIAL PRIMARY KEY,
                     platform_name VARCHAR(255) NOT NULL,
-                    dimension VARCHAR(100)
+                    dimension VARCHAR(100),
+                    templates JSONB
                 )
             """)
             

@@ -275,16 +275,22 @@ Ensure zero changes to any pixels outside the placeholder rectangle."""
                                 generated_image = Image.open(io.BytesIO(generated_image_bytes))
                                 print(f"         📐 Generated image dimensions: {generated_image.size}")
                                 
-                                # Save Gemini image locally
+                                # Save Gemini image to S3
                                 filename = f"{uuid.uuid4()}_{platform}_{dimension}_{version_name}.jpg"
-                                print(f"         💾 Saving image as: {filename}")
-                                local_path = save_image_locally(generated_image, filename)
+                                print(f"         💾 Saving image to S3 as: {filename}")
                                 
-                                if local_path:
-                                    dimension_creatives[version_name] = {"url": local_path}
-                                    print(f"         ✅ Successfully generated and saved: {local_path}")
+                                # Convert PIL image to bytes for S3 upload
+                                buffer = io.BytesIO()
+                                generated_image.save(buffer, format='JPEG', quality=85)
+                                image_bytes = buffer.getvalue()
+                                
+                                s3_url = upload_image_to_s3(image_bytes, filename)
+                                
+                                if s3_url:
+                                    dimension_creatives[version_name] = {"url": s3_url}
+                                    print(f"         ✅ Successfully generated and uploaded to S3: {s3_url}")
                                 else:
-                                    print(f"         ❌ Failed to save generated image locally")
+                                    print(f"         ❌ Failed to upload generated image to S3")
                             else:
                                 print(f"         ❌ No image data in Gemini response")
                                 print(f"         🔍 inline_data is: {generated_image_part.inline_data}")
@@ -304,18 +310,24 @@ Ensure zero changes to any pixels outside the placeholder rectangle."""
                         fallback_image = create_simple_overlay(base_image, template_image)
                         if fallback_image:
                             try:
-                                print(f"         💾 Saving fallback image...")
-                                # Save fallback image locally
+                                print(f"         💾 Saving fallback image to S3...")
+                                # Save fallback image to S3
                                 filename = f"{uuid.uuid4()}_{platform}_{dimension}_{version_name}_fallback.jpg"
-                                local_path = save_image_locally(fallback_image, filename)
                                 
-                                if local_path:
-                                    dimension_creatives[version_name] = {"url": local_path}
-                                    print(f"         ✅ Fallback image saved: {local_path}")
+                                # Convert PIL image to bytes for S3 upload
+                                buffer = io.BytesIO()
+                                fallback_image.save(buffer, format='JPEG', quality=85)
+                                image_bytes = buffer.getvalue()
+                                
+                                s3_url = upload_image_to_s3(image_bytes, filename)
+                                
+                                if s3_url:
+                                    dimension_creatives[version_name] = {"url": s3_url}
+                                    print(f"         ✅ Fallback image uploaded to S3: {s3_url}")
                                 else:
-                                    print(f"         ❌ Failed to save fallback image locally")
+                                    print(f"         ❌ Failed to upload fallback image to S3")
                             except Exception as fallback_error:
-                                print(f"         ❌ Error saving fallback image: {fallback_error}")
+                                print(f"         ❌ Error uploading fallback image: {fallback_error}")
                         else:
                             print(f"         ❌ Fallback overlay failed")
                 
@@ -347,11 +359,72 @@ Ensure zero changes to any pixels outside the placeholder rectangle."""
                 print(f"      📐 {dimension}: {len(versions)} versions")
         print(f"=" * 80)
         
+        # Save generated creatives to database
+        print(f"\n💾 STEP 6: Saving generated creatives to database")
+        save_generated_creatives_to_db(generated_creatives, base_s3_url, company_names)
+        
         return generated_creatives
         
     except Exception as e:
         print(f"Error in generate_gemini_images: {e}")
         return {}
+
+def save_generated_creatives_to_db(generated_creatives, base_s3_url, company_names):
+    """Save generated creative URLs to database"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("   ❌ Database connection failed for saving creatives")
+            return
+        
+        cursor = conn.cursor()
+        
+        # Create generated_creatives table if it doesn't exist
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS generated_creatives (
+            id SERIAL PRIMARY KEY,
+            base_image_url TEXT NOT NULL,
+            company_names TEXT[],
+            platform_name VARCHAR(50) NOT NULL,
+            dimension VARCHAR(20) NOT NULL,
+            version_name VARCHAR(50) NOT NULL,
+            generated_image_url TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+        cursor.execute(create_table_query)
+        conn.commit()
+        print("   ✅ Generated creatives table ready")
+        
+        # Insert each generated creative
+        for platform, dimensions in generated_creatives.items():
+            for dimension, versions in dimensions.items():
+                for version_name, creative_data in versions.items():
+                    insert_query = """
+                    INSERT INTO generated_creatives 
+                    (base_image_url, company_names, platform_name, dimension, version_name, generated_image_url)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """
+                    cursor.execute(insert_query, (
+                        base_s3_url,
+                        company_names,
+                        platform,
+                        dimension,
+                        version_name,
+                        creative_data['url']
+                    ))
+                    print(f"   💾 Saved: {platform} {dimension} {version_name} -> {creative_data['url']}")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("   ✅ All generated creatives saved to database")
+        
+    except Exception as e:
+        print(f"   ❌ Error saving to database: {e}")
+        if conn:
+            conn.rollback()
+            conn.close()
 
 # Configure AWS S3 (Optional)
 try:
@@ -502,7 +575,7 @@ def download_image_from_s3(bucket, s3_key):
         print(f"Error processing S3 image {bucket}/{s3_key}: {e}")
         return None
 
-def upload_image_to_s3(image, s3_key):
+def upload_pil_image_to_s3(image, s3_key):
     """Upload PIL Image to S3 and return URL"""
     if not S3_ENABLED:
         print("S3 not enabled, skipping S3 upload")

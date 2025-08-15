@@ -2,18 +2,28 @@ from flask import Flask, request, jsonify
 import psycopg
 from psycopg.rows import dict_row
 import os
+from dotenv import load_dotenv
 import json
 import requests
 from PIL import Image
 import io
 import base64
-from dotenv import load_dotenv
+import time
+import boto3
+from botocore.exceptions import ClientError
+
+# Import the working Google GenAI pattern
+from google import genai
+from google.genai import types
+import PIL.Image
+
+import logging
+logging.basicConfig(level=logging.INFO)
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
-
 # cors
 @app.after_request
 def add_cors_headers(response):
@@ -21,6 +31,87 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
     response.headers['Access-Control-Allow-Methods'] = 'GET,POST,PUT,DELETE,OPTIONS'
     return response
+
+# Initialize Google GenAI client
+GENAI_ENABLED = False
+try:
+    # Test client creation
+    test_client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+    GENAI_ENABLED = True
+    print("Google GenAI client initialized successfully")
+except Exception as e:
+    print(f"Google GenAI client initialization failed: {e}")
+    GENAI_ENABLED = False
+
+def create_simple_overlay(product_image, template_image):
+    """Create a simple overlay of product on template as fallback"""
+    print("going for overlayyyyy")
+    try:
+        # Resize product image to fit on template
+        template_width, template_height = template_image.size
+        
+        # Make product image smaller (25% of template width)
+        product_width = template_width // 4
+        product_ratio = product_image.size[1] / product_image.size[0]
+        product_height = int(product_width * product_ratio)
+        
+        # Resize product image
+        product_resized = product_image.resize((product_width, product_height), Image.Resampling.LANCZOS)
+        
+        # Create a copy of template
+        result_image = template_image.copy()
+        
+        # Calculate position (center of template)
+        x = (template_width - product_width) // 2
+        y = (template_height - product_height) // 2
+        
+        # Paste product onto template (handle transparency if needed)
+        if product_resized.mode == 'RGBA':
+            result_image.paste(product_resized, (x, y), product_resized)
+        else:
+            result_image.paste(product_resized, (x, y))
+        
+        return result_image
+    except Exception as e:
+        print(f"Error creating overlay: {e}")
+        return None
+
+def optimize_image_for_api(image, max_size=(1024, 1024), quality=85):
+    """Optimize image for API calls - resize and compress"""
+    try:
+        # Convert to RGB if necessary
+        if image.mode in ('RGBA', 'P'):
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            if image.mode == 'P':
+                image = image.convert('RGBA')
+            background.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
+            image = background
+        
+        # Resize if too large
+        if image.size[0] > max_size[0] or image.size[1] > max_size[1]:
+            image.thumbnail(max_size, Image.Resampling.LANCZOS)
+            print(f"Resized image to {image.size}")
+        
+        return image
+    except Exception as e:
+        print(f"Error optimizing image: {e}")
+        return image
+
+# Configure AWS S3 (Optional)
+try:
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        region_name=os.getenv('AWS_REGION', 'us-east-1')
+    )
+    S3_BUCKET = os.getenv('S3_BUCKET', 'hackathon-ads')
+    S3_ENABLED = True
+except Exception as e:
+    print(f"S3 not configured: {e}")
+    s3_client = None
+    S3_BUCKET = None
+    S3_ENABLED = False
 
 # Database configuration
 DB_CONFIG = {
@@ -45,8 +136,343 @@ def get_db_connection():
         print(f"Database connection error: {e}")
         return None
 
+def download_image_from_local(file_path):
+    """Load image from local file path and return PIL Image"""
+    try:
+        if os.path.exists(file_path):
+            return Image.open(file_path)
+        else:
+            print(f"Local file not found: {file_path}")
+            return None
+    except Exception as e:
+        print(f"Error loading local image {file_path}: {e}")
+        return None
 
+def save_image_locally(image, filename):
+    """Save PIL Image to local directory and return file path"""
+    try:
+        # Create local directory if it doesn't exist
+        local_dir = os.getenv('LOCAL_IMAGE_DIR', './generated_images')
+        os.makedirs(local_dir, exist_ok=True)
+        
+        file_path = os.path.join(local_dir, filename)
+        image.save(file_path, 'PNG')
+        return file_path
+    except Exception as e:
+        print(f"Error saving image locally: {e}")
+        return None
 
+def download_image_from_s3(bucket, s3_key):
+    """Download image from S3 and return PIL Image"""
+    if not S3_ENABLED:
+        print("S3 not enabled, skipping S3 download")
+        return None
+    try:
+        print(f"Downloading from S3: bucket={bucket}, key={s3_key}")
+        response = s3_client.get_object(Bucket=bucket, Key=s3_key)
+        image_data = response['Body'].read()
+        print(f"Successfully downloaded {len(image_data)} bytes from S3")
+        return Image.open(io.BytesIO(image_data))
+    except ClientError as e:
+        print(f"Error downloading image from S3 {bucket}/{s3_key}: {e}")
+        return None
+    except Exception as e:
+        print(f"Error processing S3 image {bucket}/{s3_key}: {e}")
+        return None
+
+def upload_image_to_s3(image, s3_key):
+    """Upload PIL Image to S3 and return URL"""
+    if not S3_ENABLED:
+        print("S3 not enabled, skipping S3 upload")
+        return None
+    try:
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+        buffer.seek(0)
+        
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=buffer,
+            ContentType='image/png'
+        )
+        
+        return f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
+    except Exception as e:
+        print(f"Error uploading to S3: {e}")
+        return None
+
+def download_image_from_url(url):
+    """Download image from URL, local path, or S3 and return PIL Image"""
+    try:
+        print(f"Processing URL: {url}")
+        
+        # Check if it's a local file path
+        if url.startswith('./') or url.startswith('/') or (len(url) > 1 and url[1] == ':'):
+            return download_image_from_local(url)
+        
+        # Check if it's an s3:// URL
+        elif url.startswith('s3://'):
+            s3_parts = url.replace('s3://', '').split('/', 1)
+            if len(s3_parts) == 2:
+                bucket, key = s3_parts
+                return download_image_from_s3(bucket, key)
+        
+        # Check if it's an S3 HTTPS URL
+        elif 's3.amazonaws.com' in url:
+            if '.s3.amazonaws.com/' in url:
+                bucket = url.split('//')[1].split('.s3.amazonaws.com')[0]
+                key = url.split('.s3.amazonaws.com/')[1]
+            else:
+                parts = url.split('s3.amazonaws.com/')[1].split('/', 1)
+                bucket = parts[0]
+                key = parts[1] if len(parts) > 1 else ''
+            return download_image_from_s3(bucket, key)
+        
+        # Regular URL download
+        else:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            return Image.open(io.BytesIO(response.content))
+            
+    except Exception as e:
+        print(f"Error downloading: {e}")
+        return None
+
+@app.route('/generate-ad-gemini', methods=['POST'])
+def generate_ad_gemini():
+    """Generate ad using the exact working Gemini pattern"""
+    start_time = time.time()
+    
+    try:
+        if not GENAI_ENABLED:
+            return jsonify({'error': 'Google GenAI client not available'}), 500
+        
+        data = request.get_json()
+        product_url = data.get('product_image_url')
+        template_url = data.get('template_image_url')
+        custom_prompt = ("""You are an expert graphic designer AI.
+        Task:
+        Embed a high-quality image of Nike shoes into the designated placeholder area on the uploaded Facebook creative (1200x628px).
+        Constraints:
+        1. Maintain the original layout, text, colors, and design elements of the creative exactly as they are. Do NOT move, resize, or alter any other elements.
+        2. The Nike shoes image must fit perfectly into the placeholder slot, aligned naturally with the design.
+        3. Preserve the perspective, shadows, and aesthetics of the original creative.
+        4. Output the final image in PNG format with the same resolution (1200x628).
+        5. Do not add extra text or branding. Only replace the placeholder with the Nike shoes image.
+        Input: Use the uploaded creative as the base and a realistic Nike shoes image of your choice.
+        Output: A single 1200x628 PNG image with the Nike shoes embedded exactly into the placeholder slot.
+        And use the Nike shoe that I am uploading, to be embedded in the creative""")
+        
+        if not product_url or not template_url:
+            return jsonify({'error': 'Both product_image_url and template_image_url required'}), 400
+        
+        print(f"Downloading product: {product_url}")
+        product_image = download_image_from_url(product_url)
+        if not product_image:
+            return jsonify({'error': 'Failed to download product image'}), 400
+        
+        print(f"Downloading template: {template_url}")
+        template_image = download_image_from_url(template_url)
+        if not template_image:
+            return jsonify({'error': 'Failed to download template image'}), 400
+        
+        # Use the exact working prompt pattern
+        if custom_prompt:
+            text_input = custom_prompt
+        else:
+            text_input = """You are an expert graphic designer AI.
+Task:
+Embed the product image into the designated placeholder area on the uploaded advertising template.
+Constraints:
+1. Maintain the original layout, text, colors, and design elements of the template exactly as they are. Do NOT move, resize, or alter any other elements.
+2. The product image must fit perfectly into the placeholder slot, aligned naturally with the design.
+3. Preserve the perspective, shadows, and aesthetics of the original template.
+4. Output the final image in PNG format with the same resolution as the original template.
+5. Do not add extra text or branding. Only replace the placeholder with the product image.
+Input: Use the uploaded template as the base and the product image.
+Output: A single PNG image with the product embedded exactly into the placeholder slot.
+Use the product that I am uploading, to be embedded in the template."""
+        
+        try:
+            print("Calling Gemini with working pattern...")
+            
+            # Use the exact working pattern
+            client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+            
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-preview-image-generation",
+                contents=[text_input, template_image, product_image],
+                config=types.GenerateContentConfig(
+                    response_modalities=['TEXT', 'IMAGE']
+                )
+            )
+            
+            print("Received response from Gemini")
+            
+            # Process response using the exact working pattern
+            generated_image = None
+            response_text = ""
+            
+            for part in response.candidates[0].content.parts:
+                if part.text is not None:
+                    response_text += part.text
+                    print(f"Gemini response text: {part.text}")
+                elif part.inline_data is not None:
+                    generated_image = Image.open(io.BytesIO(part.inline_data.data))
+                    print(f"Generated image received: {generated_image.size}")
+                    break
+            
+            if generated_image:
+                # Save the generated image
+                filename = f"gemini_generated_{int(time.time())}.png"
+                local_path = save_image_locally(generated_image, filename)
+                
+                # Convert to base64
+                buffer = io.BytesIO()
+                generated_image.save(buffer, format='PNG')
+                image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                
+                # Try S3 upload
+                s3_url = None
+                if S3_ENABLED:
+                    try:
+                        s3_key = f"generated/{filename}"
+                        s3_url = upload_image_to_s3(generated_image, s3_key)
+                        print(f"Saved to S3: {s3_url}")
+                    except Exception as e:
+                        print(f"S3 upload failed: {e}")
+                
+                processing_time = time.time() - start_time
+                
+                return jsonify({
+                    'status': 'success',
+                    'method': 'gemini_2.0_flash_image_generation',
+                    'generated_image_path': local_path,
+                    'generated_image_base64': image_base64,
+                    's3_url': s3_url,
+                    'processing_time': f"{processing_time:.2f}s",
+                    'gemini_response_text': response_text,
+                    'generated_image_size': list(generated_image.size),
+                    'input_images': {
+                        'product_url': product_url,
+                        'template_url': template_url,
+                        'product_size': list(product_image.size),
+                        'template_size': list(template_image.size)
+                    }
+                }), 200
+            
+            else:
+                # No image generated, fall back to overlay
+                print("No image generated by Gemini, creating overlay fallback")
+                fallback_image = create_simple_overlay(product_image, template_image)
+                
+                if fallback_image:
+                    filename = f"fallback_overlay_{int(time.time())}.png"
+                    local_path = save_image_locally(fallback_image, filename)
+                    
+                    buffer = io.BytesIO()
+                    fallback_image.save(buffer, format='PNG')
+                    image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                    
+                    processing_time = time.time() - start_time
+                    
+                    return jsonify({
+                        'status': 'success',
+                        'method': 'fallback_overlay',
+                        'generated_image_path': local_path,
+                        'generated_image_base64': image_base64,
+                        'processing_time': f"{processing_time:.2f}s",
+                        'gemini_response_text': response_text,
+                        'note': 'Gemini did not generate image, used fallback overlay'
+                    }), 200
+                else:
+                    return jsonify({
+                        'error': 'No image generated and fallback failed',
+                        'gemini_response': response_text,
+                        'processing_time': f"{(time.time() - start_time):.2f}s"
+                    }), 500
+                
+        except Exception as e:
+            print(f"Gemini generation error: {e}")
+            return jsonify({
+                'error': 'Gemini image generation failed',
+                'details': str(e),
+                'processing_time': f"{(time.time() - start_time):.2f}s"
+            }), 500
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        return jsonify({
+            'error': str(e),
+            'processing_time': f"{processing_time:.2f}s"
+        }), 500
+
+@app.route('/test-working-pattern', methods=['POST'])
+def test_working_pattern():
+    """Test the exact working pattern from your example"""
+    try:
+        if not GENAI_ENABLED:
+            return jsonify({'error': 'Google GenAI client not available'}), 400
+        
+        data = request.get_json()
+        test_prompt = data.get('prompt', 'Create a professional product advertisement')
+        
+        print("Testing exact working pattern...")
+        
+        # Use exact pattern
+        client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+        
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-preview-image-generation",
+            contents=[test_prompt],
+            config=types.GenerateContentConfig(
+                response_modalities=['TEXT', 'IMAGE']
+            )
+        )
+        
+        generated_image = None
+        response_text = ""
+        
+        for part in response.candidates[0].content.parts:
+            if part.text is not None:
+                response_text += part.text
+            elif part.inline_data is not None:
+                generated_image = Image.open(io.BytesIO(part.inline_data.data))
+                
+                # Convert to base64
+                buffer = io.BytesIO()
+                generated_image.save(buffer, format='PNG')
+                image_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                
+                return jsonify({
+                    'status': 'success',
+                    'generated_image_base64': image_base64,
+                    'generated_image_size': list(generated_image.size),
+                    'response_text': response_text
+                }), 200
+        
+        return jsonify({
+            'status': 'text_only',
+            'response_text': response_text
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e)
+        }), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'genai_enabled': GENAI_ENABLED,
+        's3_enabled': S3_ENABLED,
+        'gemini_key_exists': bool(os.getenv('GEMINI_API_KEY'))
+    }), 200
+
+# Keep all your existing endpoints
 @app.route('/creative', methods=['POST'])
 def get_creative():
     """
@@ -96,7 +522,8 @@ def get_creative():
         for row in results:
             versions.append({
                 "id": str(row['creative_id']),
-                "url": row['creative_s3_url'] or ""
+                "linkUrl": "https://google.com",
+                "imageUrl": row['creative_s3_url'] or ""
             })
         
         response = {
@@ -533,10 +960,6 @@ def crop_image_endpoint():
         print(f"Error in crop endpoint: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({'status': 'healthy'}), 200
 
 @app.errorhandler(404)
 def not_found(error):
@@ -591,3 +1014,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     debug_mode = os.environ.get('FLASK_ENV') == 'development'
     app.run(debug=debug_mode, host='0.0.0.0', port=port)
+
+ 

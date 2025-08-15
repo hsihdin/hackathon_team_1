@@ -18,7 +18,7 @@ from google.genai import types
 import PIL.Image
 
 import logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 # Load environment variables from .env file
 load_dotenv()

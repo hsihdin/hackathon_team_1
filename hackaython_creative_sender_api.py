@@ -498,9 +498,9 @@ def get_creative():
         # Query to get creatives based on adTag (matching against creative_title for demo)
         # In a real scenario, you might have an ad_tags table or similar
         query = """
-        SELECT creative_id, creative_title, creative_description, creative_s3_url, ad_item_id
-        FROM creative 
-        WHERE creative_title ILIKE %s 
+         SELECT creative_id, creative_title, creative_description, creative_s3_url, ad_item_id
+        FROM creative_new
+        WHERE tags ILIKE %s 
         ORDER BY creative_id
         LIMIT 10
         """

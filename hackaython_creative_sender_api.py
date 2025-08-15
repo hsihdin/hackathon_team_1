@@ -19,6 +19,8 @@ import PIL.Image
 
 import logging
 logging.basicConfig(level=logging.DEBUG)
+import boto3
+import uuid
 
 # Load environment variables from .env file
 load_dotenv()
@@ -122,6 +124,72 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT', '5432'),
     'sslmode': os.getenv('DB_SSLMODE', 'prefer')
 }
+
+# S3 configuration
+S3_CONFIG = {
+    'bucket_name': os.getenv('S3_BUCKET_NAME', 'your-bucket-name'),
+    'region': os.getenv('AWS_REGION', 'us-east-1')
+}
+
+def upload_image_to_s3(image_data, filename):
+    """Upload image data to S3 and return the URL"""
+    try:
+        # Check if AWS credentials are available
+        aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
+        aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        bucket_name = S3_CONFIG['bucket_name']
+        
+        print(f"Checking S3 configuration:")
+        print(f"  AWS_ACCESS_KEY_ID: {'Set' if aws_access_key else 'Not set'}")
+        print(f"  AWS_SECRET_ACCESS_KEY: {'Set' if aws_secret_key else 'Not set'}")
+        print(f"  S3_BUCKET_NAME: {bucket_name}")
+        print(f"  AWS_REGION: {S3_CONFIG['region']}")
+        
+        if not aws_access_key or not aws_secret_key:
+            print("ERROR: AWS credentials not found in environment variables")
+            print("Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+            return None
+        
+        if bucket_name == 'your-bucket-name':
+            print("ERROR: S3_BUCKET_NAME not set")
+            print("Please set S3_BUCKET_NAME environment variable")
+            return None
+        
+        print(f"Attempting to upload to S3 bucket: {bucket_name}")
+        
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=S3_CONFIG['region']
+        )
+        
+        # Test S3 connection
+        try:
+            s3_client.head_bucket(Bucket=bucket_name)
+            print(f"Successfully connected to S3 bucket: {bucket_name}")
+        except Exception as bucket_error:
+            print(f"ERROR: Cannot access S3 bucket '{bucket_name}': {bucket_error}")
+            return None
+        
+        # Upload to S3
+        print(f"Uploading file: {filename}")
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=f"cropped-images/{filename}",
+            Body=image_data,
+            ContentType='image/jpeg'
+            # Removed ACL='public-read' as bucket doesn't support ACLs
+        )
+        
+        s3_url = f"https://{bucket_name}.s3.{S3_CONFIG['region']}.amazonaws.com/cropped-images/{filename}"
+        print(f"Successfully uploaded to S3: {s3_url}")
+        return s3_url
+        
+    except Exception as e:
+        print(f"ERROR uploading to S3: {e}")
+        print(f"Error type: {type(e).__name__}")
+        return None
 
 
 
@@ -546,13 +614,13 @@ def crop_image(image_url, selected_platforms):
     Returns a JSON with all cropped images
     """
     try:
-        print(f"Starting crop process for URL: {image_url}")
+        print(f"Starting crop process for S3 URL: {image_url}")
         print(f"Selected platforms: {selected_platforms}")
         
-        # Download the image from URL
-        response = requests.get(image_url)
+        # Download the image from S3 URL
+        response = requests.get(image_url, timeout=30)
         response.raise_for_status()
-        print(f"Image downloaded successfully, size: {len(response.content)} bytes")
+        print(f"Image downloaded successfully from S3, size: {len(response.content)} bytes")
         
         # Open the image
         original_image = Image.open(io.BytesIO(response.content))
@@ -599,17 +667,42 @@ def crop_image(image_url, selected_platforms):
                     # Resize to target dimensions
                     resized = cropped.resize((width, height), Image.Resampling.LANCZOS)
                     
-                    # Convert to base64
+                    # Convert to base64 first
                     buffer = io.BytesIO()
                     resized.save(buffer, format='JPEG', quality=85)
-                    img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                    image_bytes = buffer.getvalue()
+                    img_base64 = base64.b64encode(image_bytes).decode('utf-8')
                     
-                    platform_crops[dimension] = f"data:image/jpeg;base64,{img_base64}"
+                    # Create image object with base64 data
+                    image_object = {
+                        "base64": f"data:image/jpeg;base64,{img_base64}",
+                        "width": width,
+                        "height": height,
+                        "format": "JPEG",
+                        "quality": 85
+                    }
+                    
+                    # Generate unique filename
+                    filename = f"{uuid.uuid4()}_{platform}_{dimension}.jpg"
+                    
+                    # Upload base64 image object to S3
+                    s3_url = upload_image_to_s3(image_bytes, filename)
+                    if s3_url:
+                        # Add S3 URL to the image object
+                        image_object["s3_url"] = s3_url
+                        platform_crops[dimension] = image_object
+                        print(f"    Uploaded {dimension} to S3: {s3_url}")
+                    else:
+                        print(f"    Failed to upload {dimension} to S3, keeping base64 only")
+                        platform_crops[dimension] = image_object
                 
                 cropped_images[platform] = platform_crops
         
         return cropped_images
         
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading image from S3: {e}")
+        return {}
     except Exception as e:
         print(f"Error cropping image: {e}")
         return {}
@@ -631,7 +724,8 @@ def add_new_creative():
             "callToAction": false,
             "background": false
         },
-        "image": "s3_url_string",
+        "image": "https://s3.amazonaws.com/bucket/image.jpg",
+        "imageUrl": "https://s3.amazonaws.com/bucket/image.jpg",  // Alternative field name
         "selectedPlatforms": ["platform1", "platform2"],
         "add_item_id": "uuid"
     }
@@ -639,8 +733,20 @@ def add_new_creative():
     """
     try:
         data = request.get_json()
-        if not data or 'title' not in data or 'description' not in data or 'add_item_id' not in data:
-            return jsonify({'error': 'Missing required fields: title, description, add_item_id'}), 400
+        print(f"Received request data: {data}")
+        
+        if not data:
+            return jsonify({'error': 'No JSON data received'}), 400
+        
+        if 'title' not in data or 'description' not in data or 'add_item_id' not in data:
+            missing_fields = []
+            if 'title' not in data:
+                missing_fields.append('title')
+            if 'description' not in data:
+                missing_fields.append('description')
+            if 'add_item_id' not in data:
+                missing_fields.append('add_item_id')
+            return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
         
         # Extract data from request
         title = data['title']
@@ -649,7 +755,12 @@ def add_new_creative():
         format_type = data.get('formatType', '')
         tags = data.get('tags', [])
         dynamic_elements = data.get('dynamicElements', {})
-        image = data.get('image', '')  # This should be a URL string
+        
+        # Handle both 'image' and 'imageUrl' fields
+        image = data.get('imageUrl') or data.get('image', '')
+        if isinstance(image, dict) and not image:
+            image = data.get('imageUrl', '')  # Use imageUrl if image is empty dict
+        
         selected_platforms = data.get('selectedPlatforms', [])
         add_item_id = data['add_item_id']
         
@@ -658,11 +769,17 @@ def add_new_creative():
         dynamic_elements_json = json.dumps(dynamic_elements)
         selected_platforms_json = json.dumps(selected_platforms)
         
-        # check image url
-        if not image.startswith('https://'):
-            return jsonify({'error': 'Invalid image URL'}), 400
+        # Validate S3 image URL
+        if not image or not isinstance(image, str):
+            print(f"Error: Invalid image field - {type(image)}: {image}")
+            return jsonify({'error': 'Invalid S3 image URL - must be a non-empty string'}), 400
         
-        # Crop the image
+        # Basic S3 URL validation (should start with https:// and contain s3)
+        if not (image.startswith('https://') and ('s3' in image.lower() or 'amazonaws.com' in image.lower())):
+            print(f"Warning: Image URL may not be a valid S3 URL: {image}")
+            # Don't return error, just log warning and continue
+        
+        # Crop the image from S3
         crop = crop_image(image, selected_platforms)
         if crop is None:
             crop = {}  # Set empty dict if cropping fails
@@ -698,14 +815,24 @@ def add_new_creative():
         
         # Print all cropped images for debugging
         print("=" * 50)
-        print("CROPPED IMAGES SUMMARY:")
+        print("CROPPED IMAGES WITH BASE64 AND S3 URL:")
         print("=" * 50)
         if crop:
             for platform, dimensions in crop.items():
                 print(f"\n{platform.upper()}:")
-                for dimension, base64_data in dimensions.items():
-                    print(f"  {dimension}: {base64_data[:50]}... (truncated)")
-                    print(f"    Full length: {len(base64_data)} characters")
+                for dimension, image_obj in dimensions.items():
+                    if isinstance(image_obj, dict):
+                        print(f"  {dimension}:")
+                        print(f"    Width: {image_obj.get('width')}px")
+                        print(f"    Height: {image_obj.get('height')}px")
+                        print(f"    Format: {image_obj.get('format')}")
+                        print(f"    Base64: {image_obj.get('base64')[:50]}... (truncated)")
+                        if image_obj.get('s3_url'):
+                            print(f"    S3 URL: {image_obj.get('s3_url')}")
+                        else:
+                            print(f"    S3 URL: Failed to upload")
+                    else:
+                        print(f"  {dimension}: {image_obj}")
         else:
             print("No cropped images generated")
         print("=" * 50)
@@ -938,10 +1065,10 @@ def crop_image_endpoint():
     """
     Crop image to different platform dimensions
     Expected input: {
-        "image_url": "https://example.com/image.jpg",
+        "image_url": "https://s3.amazonaws.com/bucket/image.jpg",
         "selected_platforms": ["Facebook", "Instagram"]
     }
-    Returns: {"cropped_images": {"Facebook": {"1080x1080": "base64_data", ...}, ...}}
+    Returns: {"cropped_images": {"Facebook": {"1080x1080": {"base64": "...", "s3_url": "...", "width": 1080, "height": 1080}, ...}, ...}}
     """
     try:
         data = request.get_json()
@@ -960,6 +1087,47 @@ def crop_image_endpoint():
         print(f"Error in crop endpoint: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
+
+@app.route('/s3-test', methods=['GET'])
+def test_s3_config():
+    """Test S3 configuration"""
+    try:
+        aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
+        aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        bucket_name = S3_CONFIG['bucket_name']
+        region = S3_CONFIG['region']
+        
+        config_status = {
+            'aws_access_key_id': 'Set' if aws_access_key else 'Not set',
+            'aws_secret_access_key': 'Set' if aws_secret_key else 'Not set',
+            's3_bucket_name': bucket_name,
+            'aws_region': region,
+            'status': 'Configured' if (aws_access_key and aws_secret_key and bucket_name != 'your-bucket-name') else 'Not configured'
+        }
+        
+        # Test S3 connection if credentials are available
+        if aws_access_key and aws_secret_key and bucket_name != 'your-bucket-name':
+            try:
+                s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                    region_name=region
+                )
+                s3_client.head_bucket(Bucket=bucket_name)
+                config_status['s3_connection'] = 'Success'
+                config_status['bucket_access'] = 'Accessible'
+            except Exception as e:
+                config_status['s3_connection'] = 'Failed'
+                config_status['bucket_access'] = str(e)
+        else:
+            config_status['s3_connection'] = 'Not tested'
+            config_status['bucket_access'] = 'Not tested'
+        
+        return jsonify(config_status), 200
+        
+    except Exception as e:
+        return jsonify({'error': f'S3 test failed: {e}'}), 500
 
 @app.errorhandler(404)
 def not_found(error):

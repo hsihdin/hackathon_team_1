@@ -1167,7 +1167,9 @@ if __name__ == '__main__':
                     dynamic_elements JSONB,
                     image_data JSONB,
                     selected_platforms JSONB,
+                    generated_creatives JSONB,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    
                 )
             """)
             

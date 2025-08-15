@@ -501,9 +501,10 @@ def get_creative():
         query = f"""
         SELECT creative_id, creative_title, creative_description, creative_s3_url, ad_item_id
         FROM creative_new
-        WHERE tags::text ad_tag
+        WHERE tags::text LIKE %s
         LIMIT 10
         """
+        print(query)
         
         cursor.execute(query, (f'%{ad_tag}%',))
         results = cursor.fetchall()

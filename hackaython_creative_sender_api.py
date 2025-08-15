@@ -251,18 +251,17 @@ def generate_ad_gemini():
         data = request.get_json()
         product_url = data.get('product_image_url')
         template_url = data.get('template_image_url')
-        custom_prompt = ("""You are an expert graphic designer AI.
-        Task:
-        Embed a high-quality image of Nike shoes into the designated placeholder area on the uploaded Facebook creative (1200x628px).
-        Constraints:
-        1. Maintain the original layout, text, colors, and design elements of the creative exactly as they are. Do NOT move, resize, or alter any other elements.
-        2. The Nike shoes image must fit perfectly into the placeholder slot, aligned naturally with the design.
-        3. Preserve the perspective, shadows, and aesthetics of the original creative.
-        4. Output the final image in PNG format with the same resolution (1200x628).
-        5. Do not add extra text or branding. Only replace the placeholder with the Nike shoes image.
-        Input: Use the uploaded creative as the base and a realistic Nike shoes image of your choice.
-        Output: A single 1200x628 PNG image with the Nike shoes embedded exactly into the placeholder slot.
-        And use the Nike shoe that I am uploading, to be embedded in the creative""")
+        custom_prompt = (""""You are an image editing model. Do not modify any part of the image except the specified rectangular area. Do not change any other element apart from adding an image
+ Keep all text, gradients, prices, reviews, and background elements exactly as they are.
+ The input creative contains a placeholder rectangle located at:
+ Top-left pixel: [79, 53]
+ Bottom-right pixel: [672, 444]
+ Paste the user-provided product photo into that rectangle, resizing it proportionally to exactly fit.
+ Preserve sharpness and edges. Do not rotate, crop, or alter the product. Do not add extra shadows, reflections, or text.
+ Output the final composite image in the same resolution as the input creative.
+ Ensure zero changes to any pixels outside the placeholder rectangle."
+
+""")
         
         if not product_url or not template_url:
             return jsonify({'error': 'Both product_image_url and template_image_url required'}), 400
@@ -301,7 +300,7 @@ Use the product that I am uploading, to be embedded in the template."""
             client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
             
             response = client.models.generate_content(
-                model="gemini-2.0-flash-preview-image-generation",
+                model="gemini-2.5-flash-preview-image-generation",
                 contents=[text_input, template_image, product_image],
                 config=types.GenerateContentConfig(
                     response_modalities=['TEXT', 'IMAGE']
@@ -523,12 +522,12 @@ def get_creative():
         for row in results:
             versions.append({
                 "id": str(row['creative_id']),
-                "linkUrl": "https://google.com",
                 "imageUrl": row['creative_s3_url'] or ""
             })
         
         response = {
             "creative": {
+                "linkUrl": "https://google.com",
                 "id": main_creative_id,
                 "versions": versions
             }
